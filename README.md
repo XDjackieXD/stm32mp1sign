@@ -66,3 +66,19 @@ $ stm32mp1sign --image path/to/tf-a-binary --key path/to/pubkey --verify --pubha
 > stm32key fuse 0xc0000000
 
 ```
+
+## Usage with PKCS11 HSM/Smartcard
+
+Example using a Yubikey 5:
+```
+# This will delete ALL existing keys in the PIV application!
+ykman piv reset
+# Use Slot 9A (Auth) instead of 9C (Sign), as 9C enforces a second PIN auth that can't be automatically entered.
+ykman piv keys generate --algorithm ECCP256 9A /tmp/pubkey.pem --pin-policy NEVER --touch-policy NEVER
+ykman piv certificates generate --subject "romkey" 9A /tmp/pubkey.pem -d 365000 -a SHA256
+
+STM32MP1SIGN_SIGN_PIN=123456 ./build/stm32mp1sign --key "pkcs11:token=romkey" --engine pkcs11 --image u-boot-spl.stm32 --osslconf openssl.cnf --sign
+STM32MP1SIGN_SIGN_PIN=123456 ./build/stm32mp1sign --key "pkcs11:token=romkey" --engine pkcs11 --image u-boot-spl.stm32 --osslconf openssl.cnf --verify
+```
+
+For actual usage use the import instead of generate function and keep the key in **at least** two separate locations!
