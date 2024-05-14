@@ -33,6 +33,7 @@
 #define OPENSSL_API_COMPAT 0x10101000L
 #include <openssl/opensslv.h>
 #include <openssl/ecdsa.h>
+#include <openssl/engine.h>
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 #include <openssl/pem.h>
@@ -92,12 +93,14 @@ usage(char *argv[])
         printf("              ; The only allowed EC curves are: prime256v1, brainpoolP256r1\n");
         printf("              ; Contains private and public key when signing.\n");
         printf("              ; Contains the public key when verifying.\n");
+        printf("--engine      ; If this is set, key will be used as the object string for this OpenSSL engine.\n");
         printf("--sign        ; Sign the stm32image.\n");
         printf("--verify      ; Verify the stm32image.\n");
         printf("--password    ; Not mandatory. Contains private key password. Used when signing.\n");
         printf("              ; If not used, program will ask interactively.\n");
         printf("--pubhash     ; Not mandatory. If used then the raw ec point hash of the public key\n");
         printf("              ; will be overwritten to the current dir + pubkey.hash filename.\n");
+        printf("--osslconf    ; Use the given OpenSSL config file.\n");
         printf("--version     ; %s version.\n", argv[0]);
         printf("--help        ; This help.\n");
 }
@@ -160,31 +163,89 @@ openssl_pw_cb(char *buf, int size, int rwflag UNUSED, void *u UNUSED)
         return len;
 }
 
+static int
+engine_init(const char *engine_id, ENGINE **eng_ret)
+{
+	ENGINE *engine;
+	const char *key_pass;
+
+	if (!engine_id || !engine_id[0]) {
+		fprintf(stderr, "No engine given!\n");
+		goto err_out;
+	}
+
+	ENGINE_load_builtin_engines();
+	engine = ENGINE_by_id(engine_id);
+	if (!engine) {
+		fprintf(stderr, "Engine isn't available.\n");
+		goto err_out;
+	}
+	if (!ENGINE_init(engine)) {
+		fprintf(stderr, "Couldn't initialize engine.\n");
+		goto err_out;
+	}
+
+	if (!ENGINE_set_default(engine, ENGINE_METHOD_ALL)) {
+		fprintf(stderr, "Couldn't set engine as default.\n");
+		goto err_init;
+	}
+
+	key_pass = getenv("STM32MP1SIGN_SIGN_PIN");
+	if (key_pass) {
+		if (!ENGINE_ctrl_cmd_string(engine, "PIN", key_pass, 0)) {
+			fprintf(stderr, "Couldn't set PIN\n");
+			goto err_init;
+		}
+	}
+
+	*eng_ret = engine;
+
+	return 0;
+
+err_init:
+	ENGINE_finish(engine);
+err_out:
+	if (engine) ENGINE_free(engine);
+	return -1;
+}
+
 static EC_KEY *
-openssl_load_key(const char *key_path, char *pw, bool privkey)
+openssl_load_key(const char *key_path, ENGINE *engine, char *pw, bool privkey)
 {
         BIO *bio_key = NULL;
         EVP_PKEY *key = NULL;
         EC_KEY *eckey = NULL;
+	const char *engine_id;
 
         if (!key_path || !key_path[0]) {
                 fprintf(stderr, "Invalid input.\n");
                 goto err_out;
         }
 
-        if (!(bio_key = BIO_new_file(key_path, "r"))) {
-                fprintf(stderr, "Unable to load key %s.\n", key_path);
-                goto err_out;
-        }
-        if (privkey) {
-                key = PEM_read_bio_PrivateKey(bio_key, NULL,
-                                              pw ? NULL : openssl_pw_cb,
-                                              pw ? pw : NULL);
-        } else {
-                key = PEM_read_bio_PUBKEY(bio_key, NULL,
-                                          NULL,
-                                          NULL);
-        }
+	if (engine) {
+		engine_id = ENGINE_get_id(engine);
+		
+		if(!engine_id) {
+			fprintf(stderr, "Invalid engine\n");
+			goto err_out;
+		}
+
+		key = ENGINE_load_private_key(engine, key_path, NULL, NULL);
+	} else {
+		if (!(bio_key = BIO_new_file(key_path, "r"))) {
+			fprintf(stderr, "Unable to load key %s.\n", key_path);
+			goto err_out;
+		}
+		if (privkey) {
+			key = PEM_read_bio_PrivateKey(bio_key, NULL,
+						      pw ? NULL : openssl_pw_cb,
+						      pw ? pw : NULL);
+		} else {
+			key = PEM_read_bio_PUBKEY(bio_key, NULL,
+						  NULL,
+						  NULL);
+		}
+	}
         if (!key) {
                 fprintf(stderr, "Unable to load key %s.\n",
                         key_path);
@@ -326,7 +387,11 @@ main(int argc, char *argv[])
         FILE *fp = NULL;
         unsigned char *p;
         char *key_path = NULL;
+        char *engine_id = NULL;
         char *password = NULL;
+        char *osslconf = NULL;
+	OSSL_LIB_CTX *ctx = NULL;
+	ENGINE *engine = NULL;
         EC_KEY *eckey = NULL;
         ECDSA_SIG *ecsig = NULL;
         unsigned char *data = NULL;
@@ -339,10 +404,12 @@ main(int argc, char *argv[])
         static struct option options[] = {
                 {"image", required_argument, 0, 'i'},
                 {"key", required_argument, 0, 'k'},
+                {"engine", required_argument, 0, 'e'},
                 {"sign", no_argument, 0, 's'},
                 {"verify", no_argument, 0, 'v'},
                 {"password", required_argument, 0, 'p'},
                 {"pubhash", no_argument, 0, 'x'},
+                {"osslconf", required_argument, 0, 'c'},
                 {"version", no_argument, 0, 'V'},
                 {"help", no_argument, 0, 'h'},
                 {0, 0, 0, 0}
@@ -372,6 +439,9 @@ main(int argc, char *argv[])
                 case 'k':
                         key_path = strdup(optarg);
                         break;
+		case 'e':
+			engine_id = strdup(optarg);
+			break;
                 case 's':
                         sign = true;
                         break;
@@ -384,6 +454,9 @@ main(int argc, char *argv[])
                 case 'x':
                         pubhash = true;
                         break;
+		case 'c':
+			osslconf = strdup(optarg);
+			break;
                 case 'V':
                         fprintf(stderr, "Version: %s\n", PACKAGE_VERSION);
                         goto err_out;
@@ -421,15 +494,25 @@ main(int argc, char *argv[])
                 goto err_out;
         }
 
+	ctx = OSSL_LIB_CTX_new();
+	if (osslconf && osslconf[0]) {
+		OSSL_LIB_CTX_load_config(ctx, osslconf);
+	}
+
         /* Load and validate image magic. */
         if (!(data = stm32image_load(fd, &datalen))) {
                 goto err_out;
         }
+
+	if (engine_id && engine_id[0]) {
+		engine_init(engine_id, &engine);
+	}
+
         /* Load key.
          * Contains both priv and pubkey if signing.
          * Contains only pubkey if verifying.
          */
-        if (!(eckey = openssl_load_key(key_path, password, sign))) {
+        if (!(eckey = openssl_load_key(key_path, engine, password, sign))) {
                 goto err_out;
         }
         /* Slap the header over the data so we can modify it.
@@ -520,6 +603,8 @@ main(int argc, char *argv[])
         if (ecsig) ECDSA_SIG_free(ecsig);
         if (buf) OPENSSL_free(buf);
         if (eckey) EC_KEY_free(eckey);
+	if (engine) ENGINE_free(engine);
+	if (ctx) OSSL_LIB_CTX_free(ctx);
         if (data) munmap(data, datalen);
         if (password) {
                 memset(password, 0, strlen(password));
@@ -534,6 +619,8 @@ main(int argc, char *argv[])
         if (ecsig) ECDSA_SIG_free(ecsig);
         if (buf) OPENSSL_free(buf);
         if (eckey) EC_KEY_free(eckey);
+	if (engine) ENGINE_free(engine);
+	if (ctx) OSSL_LIB_CTX_free(ctx);
         if (data) munmap(data, datalen);
         if (password) {
                 memset(password, 0, strlen(password));
